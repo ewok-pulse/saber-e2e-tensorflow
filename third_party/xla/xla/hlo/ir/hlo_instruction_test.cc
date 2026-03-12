@@ -32,6 +32,7 @@ limitations under the License.
 #include "xla/hlo/ir/stack_frames.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
 #include "xla/hlo/transforms/simplifiers/hlo_dce.h"
+#include "xla/literal_util.h"
 #include "xla/printer.h"
 #include "xla/service/hlo.pb.h"
 #include "xla/shape.h"
@@ -399,6 +400,54 @@ ENTRY main {
   TF_EXPECT_OK(module->schedule().Verify());
 }
 
+TEST_F(HloInstructionTest, CreateVariadicAsyncUpdate) {
+  constexpr absl::string_view kHlo = R"(
+HloModule main
+
+ENTRY main {
+  arg.0 = s32[] parameter(0)
+  call-start.0 = ((s32[]), s32[], s32[]) call-start(arg.0), to_apply={
+    arg.0 = s32[] parameter(0)
+    ROOT abs.0 = abs(arg.0)
+  }, async_execution_thread="thread"
+  ROOT call-done.0 = s32[] call-done(call-start.0)
+})";
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kHlo));
+
+  HloComputation* entry = module->entry_computation();
+  HloInstruction* async_done = entry->root_instruction();
+  HloInstruction* async_start = async_done->async_chain_start();
+
+  // Test 1 operand case
+  std::unique_ptr<HloInstruction> update1 = HloInstruction::CreateAsyncUpdate(
+      async_start->shape(), std::vector<HloInstruction*>{async_start});
+  EXPECT_EQ(update1->opcode(), HloOpcode::kAsyncUpdate);
+  EXPECT_EQ(update1->operand_count(), 1);
+
+  // Test 2 operands case
+  HloInstruction* const_op = entry->AddInstruction(
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<int32_t>(42)));
+
+  std::unique_ptr<HloInstruction> update2 = HloInstruction::CreateAsyncUpdate(
+      async_start->shape(),
+      std::vector<HloInstruction*>{async_start, const_op});
+  EXPECT_EQ(update2->opcode(), HloOpcode::kAsyncUpdate);
+  EXPECT_EQ(update2->operand_count(), 2);
+  EXPECT_EQ(update2->operand(1), const_op);
+
+  // Test Cloning
+  std::unique_ptr<HloInstruction> clone1 =
+      update1->CloneWithNewOperands(update1->shape(), update1->operands());
+  EXPECT_EQ(clone1->operand_count(), 1);
+
+  std::unique_ptr<HloInstruction> clone2 =
+      update2->CloneWithNewOperands(update2->shape(), update2->operands());
+  EXPECT_EQ(clone2->operand_count(), 2);
+  EXPECT_EQ(clone2->operand(1), const_op);
+}
+
 TEST_F(HloInstructionTest, CloneImplCollectivePermuteOp) {
   constexpr absl::string_view kHlo = R"(
 HloModule main
@@ -559,6 +608,91 @@ TEST_F(HloInstructionTest, MapUnaryOutputDimToOperandDimReshapeMixed) {
   EXPECT_EQ(reshape->MapUnaryOutputDimToOperandDim(0), 1);
   EXPECT_EQ(reshape->MapUnaryOutputDimToOperandDim(1), std::nullopt);
   EXPECT_EQ(reshape->MapUnaryOutputDimToOperandDim(2), 2);
+}
+
+TEST_F(HloInstructionTest, AreOperandsAndOutputFullyBound_FullyBoundStart) {
+  const char* const hlo = R"(
+HloModule test
+
+async_computation {
+  p0 = f32[2,3] parameter(0)
+  ROOT abs = f32[2,3] abs(p0)
+}
+
+ENTRY main {
+  p0 = f32[2,3] parameter(0)
+  sc-start = ((f32[2,3]), f32[2,3], s32[]) call-start(p0), to_apply=async_computation
+  ROOT done = f32[2,3] call-done(sc-start)
+}
+)";
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(hlo));
+  HloInstruction* start = FindInstruction(module.get(), "sc-start");
+  EXPECT_TRUE(
+      Cast<HloAsyncInstruction>(start)->AreOperandsAndOutputFullyBound());
+}
+
+TEST_F(HloInstructionTest, AreOperandsAndOutputFullyBound_FullyBoundUpdate) {
+  const char* const hlo = R"(
+HloModule test
+
+async_computation {
+  p0 = f32[2,3] parameter(0)
+  abs = f32[2,3] abs(p0)
+  ROOT tuple = (f32[2,3]) tuple(abs)
+}
+
+ENTRY main {
+  p0 = f32[2,3] parameter(0)
+  start = ((), (), s32[]) call-start(), to_apply=async_computation
+  update = ((f32[2,3]), (f32[2,3]), ()) call-update(start, p0)
+  ROOT done = f32[2,3] call-done(update)
+}
+)";
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(hlo));
+  HloInstruction* update = FindInstruction(module.get(), "update");
+  EXPECT_TRUE(
+      Cast<HloAsyncInstruction>(update)->AreOperandsAndOutputFullyBound());
+}
+
+TEST_F(HloInstructionTest, AreOperandsAndOutputFullyBound_PartiallyBoundStart) {
+  const char* const hlo = R"(
+HloModule test
+
+async_computation {
+  p0 = f32[2,3] parameter(0)
+  ROOT abs = f32[2,3] abs(p0)
+}
+
+ENTRY main {
+  // Partially bound since no parameters are explicitly provided
+  ROOT start = ((), (), s32[]) call-start(), to_apply=async_computation
+}
+)";
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(hlo));
+  HloInstruction* start = FindInstruction(module.get(), "start");
+  EXPECT_FALSE(
+      Cast<HloAsyncInstruction>(start)->AreOperandsAndOutputFullyBound());
+}
+
+TEST_F(HloInstructionTest, AreOperandsAndOutputFullyBound_FullyBoundDone) {
+  const char* const hlo = R"(
+HloModule test
+
+async_computation {
+  p0 = f32[2,3] parameter(0)
+  ROOT abs = f32[2,3] abs(p0)
+}
+
+ENTRY main {
+  p0 = f32[2,3] parameter(0)
+  start = ((f32[2,3]), f32[2,3], s32[]) call-start(p0), to_apply=async_computation
+  ROOT done = f32[2,3] call-done(start)
+}
+)";
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(hlo));
+  HloInstruction* done = FindInstruction(module.get(), "done");
+  EXPECT_TRUE(
+      Cast<HloAsyncInstruction>(done)->AreOperandsAndOutputFullyBound());
 }
 
 }  // namespace
