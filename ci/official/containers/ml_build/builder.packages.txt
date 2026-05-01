@@ -16,3 +16,10 @@ vim
 wget
 jq
 file
+cmake
+ninja-build
+ccache
+clang-18
+lld-18
+libstdc++-12-dev
+lsb-release
