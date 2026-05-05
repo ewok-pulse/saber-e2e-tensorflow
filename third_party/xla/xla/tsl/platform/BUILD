@@ -59,6 +59,20 @@ exports_files(
         "env.h",
         "numa_hwloc.cc",
         "numa_noop.cc",
+        "context.h",
+        "cpu_info.h",
+        "demangle.h",
+        "error_logging.h",
+        "host_info.h",
+        "human_readable_json.h",
+        "init_main.h",
+        "load_library.h",
+        "mem.h",
+        "net.h",
+        "numa.h",
+        "snappy.h",
+        "tracing.h",
+        "macros.h",
     ],
     visibility = internal_visibility([
         "//tensorflow/core/platform:__subpackages__",
@@ -332,6 +346,36 @@ filegroup(
     name = "tensor_float_32_hdr",
     srcs = [],
     compatible_with = get_compatible_with_portable(),
+)
+
+cc_library(
+    name = "tracing",
+    hdrs = ["tracing.h"],
+    compatible_with = get_compatible_with_portable(),
+    visibility = ["//visibility:public"],
+    deps = [
+        ":macros",
+        ":types",
+        "@tsl//tsl/platform",
+        "@tsl//tsl/platform:stringpiece",
+    ] + tf_platform_deps("tracing"),
+)
+
+cc_library(
+    name = "load_library",
+    hdrs = ["load_library.h"],
+    compatible_with = get_compatible_with_portable(),
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_google_absl//absl/status",
+    ] + tf_windows_aware_platform_deps("load_library"),
+)
+
+cc_library(
+    name = "numa",
+    hdrs = ["numa.h"],
+    compatible_with = get_compatible_with_portable(),
+    visibility = ["//visibility:public"],
 )
 
 cc_library(
