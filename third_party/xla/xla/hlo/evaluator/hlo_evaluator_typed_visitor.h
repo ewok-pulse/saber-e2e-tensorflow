@@ -37,6 +37,7 @@ limitations under the License.
 #include "absl/base/casts.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
 #include "absl/types/span.h"
 #include "xla/array2d.h"
 #include "xla/hlo/evaluator/hlo_evaluator.h"
@@ -1066,13 +1067,117 @@ class HloEvaluatorTypedVisitor : public ConstDfsHloVisitorWithDefault {
     return absl::OkStatus();
   }
 
+  absl::StatusOr<Literal> MaterializeSparseOperand(
+      const Literal& values, const Literal& indices,
+      const SparsityConfig::TensorSparsityConfig& config) {
+    int64_t dim = config.dimension();
+    int64_t block_size = config.block_size();
+    int64_t num_non_zero = config.num_non_zero();
+    int64_t stride = config.stride() > 0 ? config.stride() : 1;
+
+    if (dim < 0 || dim >= values.shape().dimensions_size()) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("Invalid sparsity dimension: ", dim, ", must be in [0, ",
+                       values.shape().dimensions_size(), ")"));
+    }
+    if (num_non_zero <= 0 || block_size <= 0) {
+      return absl::InvalidArgumentError(
+          "num_non_zero and block_size must be strictly positive in "
+          "SparsityConfig.");
+    }
+    if (values.shape().dimensions(dim) < num_non_zero) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Sparsity dimension size ", values.shape().dimensions(dim),
+          " is smaller than num_non_zero ", num_non_zero));
+    }
+    if (!ShapeUtil::SameDimensions(values.shape(), indices.shape())) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("Values shape ", ShapeUtil::HumanString(values.shape()),
+                       " must have the same dimensions as indices shape ",
+                       ShapeUtil::HumanString(indices.shape())));
+    }
+    if (values.shape().dimensions(dim) % num_non_zero != 0) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Sparsity dimension size ", values.shape().dimensions(dim),
+          " is not a multiple of num_non_zero ", num_non_zero));
+    }
+    int64_t slice_size = values.shape().dimensions(dim) / num_non_zero;
+    if (slice_size <= 0) {
+      return absl::InvalidArgumentError(
+          "slice_size must be strictly positive.");
+    }
+
+    std::vector<int64_t> dense_dims(values.shape().dimensions().begin(),
+                                    values.shape().dimensions().end());
+    dense_dims[dim] = (dense_dims[dim] / num_non_zero) * block_size;
+    Literal dense = Literal::CreateFromShape(
+        ShapeUtil::MakeShape(values.shape().element_type(), dense_dims));
+    dense.PopulateWithValue(static_cast<ReturnT>(0));
+
+    absl::Status status = absl::OkStatus();
+    values.EachCell<ReturnT>([&](absl::Span<const int64_t> sparse_index,
+                                 ReturnT val) {
+      if (!status.ok()) {
+        return;
+      }
+      int64_t step = indices.GetIntegralAsS64(sparse_index).value_or(0);
+      if (step < 0 || step >= block_size) {
+        status = absl::InvalidArgumentError(
+            absl::StrCat("Invalid step value: ", step, ", must be in [0, ",
+                         block_size, ")"));
+        return;
+      }
+      int64_t remainder = sparse_index[dim] % slice_size;
+      int64_t macro_block_idx = remainder / stride;
+      int64_t base = remainder % stride;
+
+      std::vector<int64_t> out_index(sparse_index.begin(), sparse_index.end());
+      out_index[dim] =
+          macro_block_idx * (block_size * stride) + step * stride + base;
+      dense.Set<ReturnT>(out_index, val);
+    });
+    if (!status.ok()) {
+      return status;
+    }
+    return dense;
+  }
+
   absl::Status HandleConvolution(const HloInstruction* conv) override {
     auto lhs = conv->operand(0);
     auto rhs = conv->operand(1);
     const auto& window = conv->window();
     Shape result_shape = GetShapeWithLayout(conv->shape());
-    Shape lhs_shape = GetShapeWithLayout(lhs->shape());
-    Shape rhs_shape = GetShapeWithLayout(rhs->shape());
+    Shape lhs_shape;
+    Shape rhs_shape;
+
+    std::optional<Literal> decompressed_lhs;
+    const Literal* lhs_literal_ptr = &parent_->GetEvaluatedLiteralFor(lhs);
+    std::optional<Literal> decompressed_rhs;
+    const Literal* rhs_literal_ptr = &parent_->GetEvaluatedLiteralFor(rhs);
+
+    if (conv->sparsity_config().has_lhs()) {
+      const Literal& tuple_lit = parent_->GetEvaluatedLiteralFor(lhs);
+      auto sub_vals = tuple_lit.Clone().DecomposeTuple();
+      TF_ASSIGN_OR_RETURN(decompressed_lhs, MaterializeSparseOperand(
+                                                sub_vals[0], sub_vals[1],
+                                                conv->sparsity_config().lhs()));
+      lhs_literal_ptr = &decompressed_lhs.value();
+      lhs_shape = lhs_literal_ptr->shape();
+    } else {
+      lhs_shape = GetShapeWithLayout(lhs->shape());
+    }
+
+    if (conv->sparsity_config().has_rhs()) {
+      const Literal& tuple_lit = parent_->GetEvaluatedLiteralFor(rhs);
+      auto sub_vals = tuple_lit.Clone().DecomposeTuple();
+      TF_ASSIGN_OR_RETURN(decompressed_rhs, MaterializeSparseOperand(
+                                                sub_vals[0], sub_vals[1],
+                                                conv->sparsity_config().rhs()));
+      rhs_literal_ptr = &decompressed_rhs.value();
+      rhs_shape = rhs_literal_ptr->shape();
+    } else {
+      rhs_shape = GetShapeWithLayout(rhs->shape());
+    }
 
     CHECK_OK(ShapeUtil::ValidateShape(lhs_shape));
     CHECK_OK(ShapeUtil::ValidateShape(rhs_shape));
@@ -1096,15 +1201,15 @@ class HloEvaluatorTypedVisitor : public ConstDfsHloVisitorWithDefault {
         auto inferred_return_shape,
         ShapeInference::InferConvolveShape(
             lhs_shape, rhs_shape, conv->feature_group_count(),
-            conv->batch_group_count(), window, dnums, conv->sparsity_config(),
+            conv->batch_group_count(), window, dnums, SparsityConfig(),
             /*preferred_element_type=*/conv->shape().element_type()));
     CHECK(ShapeUtil::Compatible(result_shape, inferred_return_shape))
         << "return shape set to: " << ShapeUtil::HumanString(result_shape)
         << " but is inferred to be: "
         << ShapeUtil::HumanString(inferred_return_shape);
 
-    const Literal& lhs_literal = parent_->GetEvaluatedLiteralFor(lhs);
-    const Literal& rhs_literal = parent_->GetEvaluatedLiteralFor(rhs);
+    const Literal& lhs_literal = *lhs_literal_ptr;
+    const Literal& rhs_literal = *rhs_literal_ptr;
     const bool lhs_same = ShapeUtil::SameElementType(lhs_shape, result_shape);
     const bool rhs_same = ShapeUtil::SameElementType(rhs_shape, result_shape);
     if (rhs_same && lhs_same) {
